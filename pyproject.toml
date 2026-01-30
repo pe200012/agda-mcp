@@ -1,0 +1,16 @@
+[project]
+name = "agda-mcp-py"
+version = "0.1.0"
+description = "A Python implementation of the Agda MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+]
+
+[project.scripts]
+agda-mcp-py = "agda_mcp_py.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

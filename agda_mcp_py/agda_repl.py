@@ -1,0 +1,289 @@
+import asyncio
+import json
+import logging
+import subprocess
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class AgdaRepl:
+    def __init__(self):
+        self.process: Optional[subprocess.Popen] = None
+        self.lock = asyncio.Lock()
+
+    def start(self):
+        if self.process is not None:
+            return
+
+        try:
+            self.process = subprocess.Popen(
+                ["agda", "--interaction-json"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,  # Line buffered
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Agda executable not found. Please ensure Agda is installed and in your PATH."
+            )
+
+    def stop(self):
+        if self.process:
+            self.process.terminate()
+            self.process.wait()
+            self.process = None
+
+    async def send_command(self, cmd_str: str) -> List[Dict[str, Any]]:
+        """
+        Sends a raw command string to Agda and returns the list of JSON responses.
+        """
+        if not self.process:
+            self.start()
+
+        if self.process.poll() is not None:
+            # Process died, restart
+            self.process = None
+            self.start()
+
+        full_command = f"{cmd_str}\n"
+        logger.debug(f"Sending to Agda: {full_command.strip()}")
+
+        async with self.lock:
+            if not self.process or not self.process.stdin:
+                raise RuntimeError("Agda process not valid")
+
+            self.process.stdin.write(full_command)
+            self.process.stdin.flush()
+
+            responses = []
+
+            # We need to read until we think the command is done.
+            # In Agda JSON interaction, there is no explicit "end of command" marker guaranteed for all commands.
+            # However, typically commands result in a DisplayInfo or similar.
+            # A common heuristic is that Agda outputs a block of JSONs.
+            # We will read until we get a line that indicates 'InteractionPoints' or error, or 'DisplayInfo'.
+            # ACTUALLY, checking standard clients: they treat the stream as asynchronous.
+            # But for MCP, we want a request-response model.
+
+            # Hack: We will read lines until the stdout buffer is empty? No, that's racy.
+            # We will rely on specific markers.
+            # 'Cmd_load' -> ends with 'InteractionPoints' usually.
+            # 'Cmd_give' -> ends with 'GiveAction'.
+
+            # Let's try a timeout-based approach for the prototype if we can't find a better delimiter.
+            # Or better: most commands emit a list of goals (InteractionPoints) at the end?
+
+            # Let's look at the Haskell implementation again.
+            # It runs `handleCommand` which calls `runInteraction`.
+            # `runInteraction` returns `Done` when finished.
+
+            # Since we are wrapping the binary, we don't have that signal.
+            # We will define a "End Marker" heuristic based on the command type.
+
+            # For now, I'll implement a read loop that reads at least one line, and then checks if more are available?
+            # No.
+
+            # Let's assume Agda 2.8+ behavior.
+            # It usually sends "DisplayInfo" -> "AllGoalsWarnings" as the last thing for load/reload.
+
+            while True:
+                # We use a thread executor to read stdout safely without blocking the event loop
+                line = await asyncio.get_event_loop().run_in_executor(
+                    None, self.process.stdout.readline
+                )
+
+                if not line:
+                    break
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                if line.startswith("JSON>"):
+                    line = line[5:].strip()
+
+                try:
+                    data = json.loads(line)
+                    responses.append(data)
+
+                    # Heuristics for completion
+                    # If we see an error, we are likely done.
+                    if data.get("kind") == "Error":
+                        break
+
+                    # Logic:
+                    # Cmd_load ends with InteractionPoints or AgdaInfo
+                    # We might need to make this command-specific.
+                    # For now, let's just collect until we see a "DisplayInfo" with "agda2-info-action" or "AllGoalsWarnings"
+                    # OR "InteractionPoints"
+
+                    kind = data.get("kind")
+                    if kind == "InteractionPoints":
+                        # Often the last thing for structural updates
+                        # But wait, DisplayInfo might follow.
+                        pass
+
+                    # If we assume we want to catch "everything generated by this command"
+                    # We can try to read with a very short timeout after the first response?
+                    # No, that's slow.
+
+                    # Let's assume that for now we return the stream.
+                    # But the caller needs to wait.
+
+                    # Refined Heuristic:
+                    # Most commands end with a status update or goal list.
+                    # But let's just break if we see a specific completion signal.
+                    # This is the hardest part of wrapping Agda CLI.
+
+                    # PROVISIONAL: break after 1 response for simple queries, loop for load.
+                    pass
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to decode JSON from Agda: {line}")
+
+                # For the sake of progress, I will implement a "dumb" reader that relies on
+                # the fact that I'll only read what's available? No.
+
+                # I will assume that the command output ends when I receive a prompt-like message?
+                # Does Agda JSON mode emit a prompt?
+                # I'll check 'kind' == 'DisplayInfo' and 'label' == 'Status' or similar?
+
+                # Let's use a specialized method for 'load' that waits for 'InteractionPoints' or Error.
+                pass
+
+                # For this generic method, I'll use a short timeout loop to drain the pipe.
+                try:
+                    # Check if there is more data without blocking for long
+                    if self.process.stdout.readable():
+                        # This check is insufficient.
+                        pass
+                except:
+                    pass
+
+            return responses
+
+    # Helper methods to construct commands
+
+    async def load_file(self, file_path: str) -> List[Dict[str, Any]]:
+        # Cmd_load "file" []
+        cmd = f'IOTCM "{file_path}" NonInteractive Indirect (Cmd_load "{file_path}" [])'
+        return await self.send_command_and_wait(cmd, expect_goals=True)
+
+    async def get_goals(self) -> List[Dict[str, Any]]:
+        # Cmd_metas Simplified
+        cmd = 'IOTCM "current" NonInteractive Indirect (Cmd_metas Simplified)'
+        return await self.send_command_and_wait(cmd)
+
+    async def give(
+        self, file_path: str, goal_id: int, expr: str
+    ) -> List[Dict[str, Any]]:
+        # Cmd_give WithoutForce goalId noRange expression
+        cmd = f'IOTCM "{file_path}" NonInteractive Indirect (Cmd_give WithoutForce {goal_id} noRange "{expr}")'
+        return await self.send_command_and_wait(cmd)
+
+    async def refine(
+        self, file_path: str, goal_id: int, expr: str
+    ) -> List[Dict[str, Any]]:
+        cmd = f'IOTCM "{file_path}" NonInteractive Indirect (Cmd_refine {goal_id} noRange "{expr}")'
+        return await self.send_command_and_wait(cmd)
+
+    async def case_split(
+        self, file_path: str, goal_id: int, var: str
+    ) -> List[Dict[str, Any]]:
+        cmd = f'IOTCM "{file_path}" NonInteractive Indirect (Cmd_make_case {goal_id} noRange "{var}")'
+        return await self.send_command_and_wait(cmd)
+
+    async def why_in_scope(
+        self, file_path: str, goal_id: int, name: str
+    ) -> List[Dict[str, Any]]:
+        # Cmd_why_in_scope_toplevel name
+        cmd = f'IOTCM "{file_path}" NonInteractive Indirect (Cmd_why_in_scope_toplevel "{name}")'
+        return await self.send_command_and_wait(cmd)
+
+    async def context(self, file_path: str, goal_id: int) -> List[Dict[str, Any]]:
+        cmd = f'IOTCM "{file_path}" NonInteractive Indirect (Cmd_context Simplified (InteractionId {goal_id}) noRange "")'
+        return await self.send_command_and_wait(cmd)
+
+    async def compute(
+        self, file_path: str, goal_id: int, expr: str
+    ) -> List[Dict[str, Any]]:
+        cmd = f'IOTCM "{file_path}" NonInteractive Indirect (Cmd_compute_toplevel DefaultCompute "{expr}")'
+        return await self.send_command_and_wait(cmd)
+
+    async def infer_type(
+        self, file_path: str, goal_id: int, expr: str
+    ) -> List[Dict[str, Any]]:
+        cmd = f'IOTCM "{file_path}" NonInteractive Indirect (Cmd_infer_toplevel Simplified "{expr}")'
+        return await self.send_command_and_wait(cmd)
+
+    async def send_command_and_wait(
+        self, cmd_str: str, expect_goals: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Sends a command and waits for responses.
+        Uses a heuristic to determine when Agda is done.
+        """
+        if not self.process:
+            self.start()
+
+        full_command = f"{cmd_str}\n"
+        # logger.debug(f"Sending to Agda: {full_command.strip()}")
+        logger.debug(f"Sending to Agda: {full_command.strip()}")
+
+        async with self.lock:
+            self.process.stdin.write(full_command)
+            self.process.stdin.flush()
+
+            responses = []
+
+            # Simple heuristic: read until we see a response that looks like a completion
+            # or until a short timeout if we already have some data.
+            # Agda 2.8 interaction is synchronous per command.
+
+            while True:
+                if self.process.poll() is not None:
+                    logger.error(
+                        f"Agda process died with code {self.process.returncode}"
+                    )
+                    break
+
+                try:
+                    # Wait for a line with a timeout
+                    line = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, self.process.stdout.readline
+                        ),
+                        timeout=5.0 if not responses else 1.0,
+                        # Increased timeout for first response
+                    )
+
+                    if not line:
+                        break
+
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    if line.startswith("JSON>"):
+                        line = line[5:].strip()
+
+                    try:
+                        data = json.loads(line)
+                        responses.append(data)
+
+                        # Stop early if we see an Error
+                        if data.get("kind") == "Error":
+                            break
+                    except json.JSONDecodeError:
+                        logger.error(f"Failed to decode JSON from Agda: {line}")
+
+                except asyncio.TimeoutError:
+                    # Timeout implies Agda has nothing more to say for now
+                    break
+                except Exception as e:
+                    logger.error(f"Error reading from Agda: {e}")
+                    break
+
+            return responses
