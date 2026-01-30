@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 try:
     from .agda_repl import AgdaRepl
     from .file_edit import replace_hole, replace_line, Range
-    from .types import (
+    from .agda_types import (
         AgdaLoad,
         AgdaGetGoals,
         AgdaGetGoalType,
@@ -28,7 +28,7 @@ except ImportError:
     # Fallback for running directly if needed
     from agda_repl import AgdaRepl
     from file_edit import replace_hole, replace_line, Range
-    from types import (
+    from agda_types import (
         AgdaLoad,
         AgdaGetGoals,
         AgdaGetGoalType,
