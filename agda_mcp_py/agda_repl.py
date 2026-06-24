@@ -22,6 +22,17 @@ SETTLE = 0.15  # grace drain after terminal seen
 HARD_TIMEOUT = 120.0  # max silence while waiting for terminal (type-checking can be slow)
 
 
+def _q(s: str) -> str:
+    """Quote a string argument for an IOTCM command.
+
+    ensure_ascii=False is essential: Agda identifiers are Unicode (λ Γ Δ → ⊢ …)
+    and the interaction parser reads UTF-8 literally — it rejects the \\uXXXX
+    escapes that json.dumps emits by default. Quotes/backslashes/newlines are
+    still escaped so the argument can't break the command.
+    """
+    return json.dumps(s, ensure_ascii=False)
+
+
 def _is_error(data: Dict[str, Any]) -> bool:
     if data.get("kind") == "Error" or data.get("kind") == "ParseError":
         return True
@@ -134,10 +145,10 @@ class AgdaRepl:
     # containing quotes/backslashes/newlines can't break the IOTCM command.
 
     def _iotcm(self, file_path: str, body: str) -> str:
-        return f"IOTCM {json.dumps(file_path)} NonInteractive Indirect ({body})"
+        return f"IOTCM {_q(file_path)} NonInteractive Indirect ({body})"
 
     async def load_file(self, file_path: str) -> List[Dict[str, Any]]:
-        body = f"Cmd_load {json.dumps(file_path)} []"
+        body = f"Cmd_load {_q(file_path)} []"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_POINTS)
 
     async def get_goals(self, file_path: str) -> List[Dict[str, Any]]:
@@ -147,20 +158,20 @@ class AgdaRepl:
         )
 
     async def give(self, file_path: str, goal_id: int, expr: str) -> List[Dict[str, Any]]:
-        body = f"Cmd_give WithoutForce {goal_id} noRange {json.dumps(expr)}"
+        body = f"Cmd_give WithoutForce {goal_id} noRange {_q(expr)}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_POINTS)
 
     async def refine(self, file_path: str, goal_id: int, expr: str) -> List[Dict[str, Any]]:
-        body = f"Cmd_refine {goal_id} noRange {json.dumps(expr)}"
+        body = f"Cmd_refine {goal_id} noRange {_q(expr)}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_POINTS)
 
     async def case_split(self, file_path: str, goal_id: int, var: str) -> List[Dict[str, Any]]:
-        body = f"Cmd_make_case {goal_id} noRange {json.dumps(var)}"
+        body = f"Cmd_make_case {goal_id} noRange {_q(var)}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_POINTS)
 
     async def auto_one(self, file_path: str, goal_id: int, hints: str = "") -> List[Dict[str, Any]]:
         # Agda >= 2.7: Cmd_autoOne takes a leading Rewrite (AsIs) argument.
-        body = f"Cmd_autoOne AsIs {goal_id} noRange {json.dumps(hints)}"
+        body = f"Cmd_autoOne AsIs {goal_id} noRange {_q(hints)}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_POINTS)
 
     async def auto_all(self, file_path: str) -> List[Dict[str, Any]]:
@@ -169,27 +180,27 @@ class AgdaRepl:
         )
 
     async def intro(self, file_path: str, goal_id: int) -> List[Dict[str, Any]]:
-        body = f"Cmd_intro False {goal_id} noRange {json.dumps('')}"
+        body = f"Cmd_intro False {goal_id} noRange {_q('')}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_POINTS)
 
     async def why_in_scope(self, file_path: str, name: str) -> List[Dict[str, Any]]:
-        body = f"Cmd_why_in_scope_toplevel {json.dumps(name)}"
+        body = f"Cmd_why_in_scope_toplevel {_q(name)}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_INFO)
 
     async def context(self, file_path: str, goal_id: int) -> List[Dict[str, Any]]:
-        body = f"Cmd_context Simplified {goal_id} noRange {json.dumps('')}"
+        body = f"Cmd_context Simplified {goal_id} noRange {_q('')}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_INFO)
 
     async def goal_type(self, file_path: str, goal_id: int) -> List[Dict[str, Any]]:
-        body = f"Cmd_goal_type Simplified {goal_id} noRange {json.dumps('')}"
+        body = f"Cmd_goal_type Simplified {goal_id} noRange {_q('')}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_INFO)
 
     async def compute(self, file_path: str, goal_id: int, expr: str) -> List[Dict[str, Any]]:
         # ponytail: toplevel compute (ignores goal context); switch to
         # `Cmd_compute DefaultCompute {goal_id} noRange ...` if goal-local needed.
-        body = f"Cmd_compute_toplevel DefaultCompute {json.dumps(expr)}"
+        body = f"Cmd_compute_toplevel DefaultCompute {_q(expr)}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_INFO)
 
     async def infer_type(self, file_path: str, goal_id: int, expr: str) -> List[Dict[str, Any]]:
-        body = f"Cmd_infer_toplevel Simplified {json.dumps(expr)}"
+        body = f"Cmd_infer_toplevel Simplified {_q(expr)}"
         return await self._interact(self._iotcm(file_path, body), TERMINAL_INFO)

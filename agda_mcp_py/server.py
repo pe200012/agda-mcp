@@ -185,7 +185,9 @@ async def agda_get_goal_type(goalId: int) -> str:
         if resp.get("kind") == "DisplayInfo":
             info = resp.get("info", {})
             if info.get("kind") == "GoalSpecific":
-                type_str = info.get("typeAux", {}).get("expr", "") or info.get("type", "")
+                # Agda 2.8: the type lives under goalInfo.type.
+                gi = info.get("goalInfo", {})
+                type_str = gi.get("type") or info.get("type", "")
                 return f"?{goalId} : {type_str}"
     err = _error_message(responses)
     return f"Error: {err}" if err else "Could not determine goal type."
@@ -200,10 +202,13 @@ async def agda_get_context(goalId: int) -> str:
     for resp in responses:
         if resp.get("kind") == "DisplayInfo":
             info = resp.get("info", {})
-            if info.get("kind") == "GoalSpecific":
+            # Agda 2.8: GoalSpecific carries the hypotheses under `context`, each
+            # with its type in `binding` (not `entries`/`type`).
+            entries = info.get("context")
+            if entries is not None:
                 out = ["Context:"]
-                for e in info.get("entries", []):
-                    out.append(f"  {e.get('reifiedName', '?')} : {e.get('type', '?')}")
+                for e in entries:
+                    out.append(f"  {e.get('reifiedName', '?')} : {e.get('binding', '?')}")
                 return "\n".join(out)
     err = _error_message(responses)
     return f"Error: {err}" if err else "Could not retrieve context."

@@ -110,6 +110,28 @@ async def main():
     assert "✓ suc  → leaves 1 hole(s): Nat" in tr, tr
     assert open(path3).read() == before, "agda_try (refine) must not edit the file"
 
+    # 11. Unicode + per-goal queries (regression for 3 dogfooding bugs):
+    #     (a) sending Unicode expressions must not be \uXXXX-escaped,
+    #     (b) agda_get_goal_type must read goalInfo.type,
+    #     (c) agda_get_context must read context[].binding.
+    path4 = os.path.join(d, "Uni.agda")
+    with open(path4, "w", encoding="utf-8") as f:
+        f.write("module Uni where\n\ndata ℕ : Set where\n  zero : ℕ\n  suc : ℕ → ℕ\n\n"
+                "f : ℕ → ℕ\nf n = ?\n\ng : ℕ → ℕ\ng = ?\n")
+    await S.agda_load(path4)
+    gt = await S.agda_get_goal_type(0)
+    print(f"[goal_type] {gt}")
+    assert gt.strip() == "?0 : ℕ", gt                          # bug (b)
+    ctx = await S.agda_get_context(0)
+    print(f"[context]\n{ctx}")
+    assert "n : ℕ" in ctx, ctx                                  # bug (c)
+    ut = await S.agda_try(1, ["λ x → x", "λ x → suc x"])        # bug (a): Unicode send
+    print(f"[unicode try]\n{ut}")
+    assert "✓ λ x → x" in ut and "✓ λ x → suc x" in ut, ut
+    r = await S.agda_give(1, "λ x → suc x")
+    print(f"[unicode give] {r}")
+    assert "Filled" in r and "g = λ x → suc x" in open(path4, encoding="utf-8").read(), r
+
     S.repl.stop()
     shutil.rmtree(d, ignore_errors=True)
     print("\nALL PASSED")
