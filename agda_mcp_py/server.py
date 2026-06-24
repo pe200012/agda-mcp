@@ -1,48 +1,13 @@
 import logging
-import asyncio
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Any
 from mcp.server.fastmcp import FastMCP
 
-# Import from local modules
-# Since we are running as a script/module, we need to handle imports carefully.
-# In a proper package, we use relative imports.
 try:
     from .agda_repl import AgdaRepl
     from .file_edit import replace_hole, replace_line, Range
-    from .agda_types import (
-        AgdaLoad,
-        AgdaGetGoals,
-        AgdaGetGoalType,
-        AgdaGetContext,
-        AgdaGive,
-        AgdaRefine,
-        AgdaCaseSplit,
-        AgdaCompute,
-        AgdaInferType,
-        AgdaIntro,
-        AgdaWhyInScope,
-        AgdaAuto,
-        AgdaAutoAll,
-    )
-except ImportError:
-    # Fallback for running directly if needed
+except ImportError:  # running as a loose script
     from agda_repl import AgdaRepl
     from file_edit import replace_hole, replace_line, Range
-    from agda_types import (
-        AgdaLoad,
-        AgdaGetGoals,
-        AgdaGetGoalType,
-        AgdaGetContext,
-        AgdaGive,
-        AgdaRefine,
-        AgdaCaseSplit,
-        AgdaCompute,
-        AgdaInferType,
-        AgdaIntro,
-        AgdaWhyInScope,
-        AgdaAuto,
-        AgdaAutoAll,
-    )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agda-mcp")
@@ -50,273 +15,307 @@ logger = logging.getLogger("agda-mcp")
 mcp = FastMCP("Agda MCP")
 repl = AgdaRepl()
 
-# State
+# State refreshed from every command's responses.
 goals_map: Dict[int, Range] = {}
+goal_types: Dict[int, str] = {}
+last_diagnostics: Dict[str, List[str]] = {"errors": [], "warnings": []}
 current_file: str = ""
 
 
-def update_goals(responses: List[Dict[str, Any]]):
-    """
-    Parses responses to update the goals_map.
-    """
-    global goals_map
+def update_state(responses: List[Dict[str, Any]]):
+    """Refresh goal ranges, goal types, and diagnostics from Agda responses."""
+    global goals_map, goal_types, last_diagnostics
     for resp in responses:
         if resp.get("kind") == "InteractionPoints":
-            points = resp.get("interactionPoints", [])
-            for pt in points:
-                # pt: {"id": 1, "range": [...]}
+            goals_map = {}
+            for pt in resp.get("interactionPoints", []):
                 if "id" in pt and "range" in pt:
                     goals_map[pt["id"]] = Range.from_json(pt["range"])
 
-    logger.debug(f"Updated goals map: {len(goals_map)} goals")
+        if resp.get("kind") == "DisplayInfo":
+            info = resp.get("info", {})
+            if info.get("kind") == "AllGoalsWarnings":
+                goal_types = {}
+                for g in info.get("visibleGoals", []):
+                    obj = g.get("constraintObj", {})
+                    gid = obj.get("id")
+                    if gid is not None:
+                        goal_types[gid] = g.get("type", "?")
+                        if "range" in obj:
+                            goals_map[gid] = Range.from_json(obj["range"])
+                last_diagnostics = {
+                    "errors": [str(e) for e in info.get("errors", [])],
+                    "warnings": [str(w) for w in info.get("warnings", [])],
+                }
+
+
+def _error_message(responses: List[Dict[str, Any]]) -> str:
+    for resp in responses:
+        if resp.get("kind") == "ParseError":
+            return f"Malformed command: {resp.get('message')}"
+        info = resp.get("info") if isinstance(resp.get("info"), dict) else None
+        if resp.get("kind") == "Error":
+            return str(resp.get("message", resp))
+        if info and info.get("kind") == "Error":
+            return str(info.get("message") or info.get("payload") or info)
+    return ""
 
 
 def handle_edits(file_path: str, responses: List[Dict[str, Any]]) -> List[str]:
+    """Apply GiveAction / MakeCase edits to the source file.
+
+    Each edit carries its own goal range, so we apply them bottom-up (later
+    positions first) — auto_all can fill several holes at once and editing a
+    lower hole must not shift the ranges of holes above it.
     """
-    Parses responses for edit actions and applies them.
-    Returns a list of descriptions of what was done.
-    """
-    edits_performed = []
+    gives = []   # (Range, content, wrap_parens, goal_id)
+    cases = []   # (line_num, clauses, goal_id)
 
     for resp in responses:
         kind = resp.get("kind")
+        ip = resp.get("interactionPoint", {})
+        ip_id = ip.get("id")
 
-        if kind == "GiveAction" or "giveResult" in resp:
-            # {"kind": "GiveAction", "interactionPoint": {"id": 1, ...}, "giveResult": {"str": "refl", ...}}
-            # Structure varies by Agda version.
-            # Agda 2.8:
-            # "giveResult": { "kind": "Give_String", "str": "..." } or { "kind": "Give_Paren" }
-            # Or simplified: "giveResult": {"str": "x"}
-
-            ip_id = resp.get("interactionPoint", {}).get("id")
+        if kind == "GiveAction":
+            rng = Range.from_json(ip["range"]) if "range" in ip else goals_map.get(ip_id)
+            if rng is None:
+                logger.warning("GiveAction for unknown goal %s", ip_id)
+                continue
             result = resp.get("giveResult", {})
-            res_kind = result.get("kind")
-
-            # Fallback for simplified structure
-            if res_kind is None and "str" in result:
-                res_kind = "Give_String"
-
-            if ip_id is not None and ip_id in goals_map:
-                goal_range = goals_map[ip_id]
-
-                if res_kind == "Give_String":
-                    content = result.get("str", "")
-                    replace_hole(file_path, goal_range, content)
-                    edits_performed.append(f"Filled goal ?{ip_id} with '{content}'")
-                elif res_kind == "Give_Paren":
-                    replace_hole(file_path, goal_range, "", wrap_parens=True)
-                    edits_performed.append(f"Wrapped goal ?{ip_id} in parentheses")
+            res_kind = result.get("kind") or ("Give_String" if "str" in result else None)
+            if res_kind == "Give_Paren":
+                gives.append((rng, "", True, ip_id))
             else:
-                logger.warning(f"GiveAction for unknown goal {ip_id}")
+                gives.append((rng, result.get("str", ""), False, ip_id))
 
-        elif kind == "MakeCase" or "clauses" in resp:
-            # {"kind": "MakeCase", "interactionPoint": {"id": 1, ...}, "clauses": ["...", "..."]}
-            ip_id = resp.get("interactionPoint", {}).get("id")
-            clauses = resp.get("clauses", [])
+        elif kind == "MakeCase":
+            rng = Range.from_json(ip["range"]) if "range" in ip else goals_map.get(ip_id)
+            if rng is None:
+                logger.warning("MakeCase for unknown goal %s", ip_id)
+                continue
+            cases.append((rng.start_line, resp.get("clauses", []), ip_id))
 
-            if ip_id is not None and ip_id in goals_map:
-                goal_range = goals_map[ip_id]
-                # MakeCase replaces the *line* containing the goal.
-                # goal_range.start_line is 1-based.
-                replace_line(file_path, goal_range.start_line, clauses)
-                edits_performed.append(
-                    f"Case split on goal ?{ip_id}, generated {len(clauses)} clauses"
-                )
-            else:
-                logger.warning(f"MakeCase for unknown goal {ip_id}")
+    edits = []
+    # Apply bottom-up so earlier (lower-line/col) edits don't invalidate ranges above.
+    for line_num, clauses, gid in sorted(cases, key=lambda c: c[0], reverse=True):
+        replace_line(file_path, line_num, clauses)
+        edits.append(f"Case split on ?{gid}: {len(clauses)} clauses")
+    for rng, content, wrap, gid in sorted(
+        gives, key=lambda e: (e[0].start_line, e[0].start_col), reverse=True
+    ):
+        replace_hole(file_path, rng, content, wrap_parens=wrap)
+        edits.append(
+            f"Wrapped ?{gid} in parens" if wrap else f"Filled ?{gid} with '{content}'"
+        )
+    return edits
 
-    return edits_performed
+
+def _require_file() -> str:
+    return "" if current_file else "No file loaded. Use agda_load first."
 
 
 @mcp.tool()
 async def agda_load(file: str) -> str:
     """Load and type-check an Agda file."""
-    global current_file, goals_map
+    global current_file
     current_file = file
-    goals_map = {}  # Reset goals
-
     responses = await repl.load_file(file)
-    update_goals(responses)
-
-    # Check for errors
-    errors = [r for r in responses if r.get("kind") == "Error"]
-    if errors:
-        msg = errors[0].get("message", "Unknown error")
-        return f"Error loading file: {msg}"
-
-    return f"Loaded {file}. Found {len(goals_map)} goals."
+    update_state(responses)
+    err = _error_message(responses)
+    if err:
+        return f"Error loading file: {err}"
+    out = [f"Loaded {file}. {len(goals_map)} goal(s)."]
+    if last_diagnostics["warnings"]:
+        out.append(f"{len(last_diagnostics['warnings'])} warning(s).")
+    return " ".join(out)
 
 
 @mcp.tool()
 async def agda_get_goals() -> str:
-    """List all goals/holes in the currently loaded file."""
-    if not current_file:
-        return "No file loaded. Please use agda_load first."
-
-    responses = await repl.get_goals()
-    update_goals(responses)
-
-    # Format output
-    if not goals_map:
+    """List all goals/holes with their expected types and any warnings."""
+    if msg := _require_file():
+        return msg
+    responses = await repl.get_goals(current_file)
+    update_state(responses)
+    if not goal_types and not goals_map:
         return "No goals found."
-
-    out = []
-    for gid, rng in goals_map.items():
-        # Ideally we want the type too, but interaction points just gives location.
-        # We need to query goal type separately or parsing 'AllGoalsWarnings' if available.
-        # But 'agda_get_goals' usually returns a summary.
-        # We can try to get types? No, that's expensive (N roundtrips).
-        # We'll just list IDs and locations.
-        out.append(f"?{gid} at {rng}")
-
-    return "\n".join(out)
+    lines = []
+    for gid in sorted(set(goal_types) | set(goals_map)):
+        typ = goal_types.get(gid, "?")
+        loc = f"  [{goals_map[gid]}]" if gid in goals_map else ""
+        lines.append(f"?{gid} : {typ}{loc}")
+    if last_diagnostics["warnings"]:
+        lines.append("\nWarnings:")
+        lines.extend(f"  {w}" for w in last_diagnostics["warnings"])
+    return "\n".join(lines)
 
 
 @mcp.tool()
 async def agda_get_goal_type(goalId: int) -> str:
     """Get the type expected at a specific goal."""
-    if not current_file:
-        return "No file loaded."
-
+    if msg := _require_file():
+        return msg
     responses = await repl.goal_type(current_file, goalId)
-    # Parse 'GoalSpecific' or 'DisplayInfo' -> 'GoalSpecific'
-
     for resp in responses:
         if resp.get("kind") == "DisplayInfo":
             info = resp.get("info", {})
             if info.get("kind") == "GoalSpecific":
-                # Agda 2.8: { "kind": "GoalSpecific", "interactionPoint": ..., "type": "...", ... }
-                # Or sometimes plain text in 'typeAux'?
-                type_str = info.get("typeAux", {}).get("expr", "") or info.get(
-                    "type", ""
-                )
+                type_str = info.get("typeAux", {}).get("expr", "") or info.get("type", "")
                 return f"?{goalId} : {type_str}"
-
-    return "Could not determine goal type."
+    err = _error_message(responses)
+    return f"Error: {err}" if err else "Could not determine goal type."
 
 
 @mcp.tool()
 async def agda_get_context(goalId: int) -> str:
     """Get the context (available variables) at a specific goal."""
-    if not current_file:
-        return "No file loaded."
-
+    if msg := _require_file():
+        return msg
     responses = await repl.context(current_file, goalId)
-
     for resp in responses:
         if resp.get("kind") == "DisplayInfo":
             info = resp.get("info", {})
             if info.get("kind") == "GoalSpecific":
-                # entries is a list of {originalName, reifiedName, binding, type}
-                entries = info.get("entries", [])
                 out = ["Context:"]
-                for e in entries:
-                    name = e.get("reifiedName", "?")
-                    typ = e.get("type", "?")
-                    out.append(f"  {name} : {typ}")
+                for e in info.get("entries", []):
+                    out.append(f"  {e.get('reifiedName', '?')} : {e.get('type', '?')}")
                 return "\n".join(out)
-
-    return "Could not retrieve context."
+    err = _error_message(responses)
+    return f"Error: {err}" if err else "Could not retrieve context."
 
 
 @mcp.tool()
 async def agda_give(goalId: int, expression: str) -> str:
     """Fill a goal with an expression. Automatically edits the file."""
-    if not current_file:
-        return "No file loaded."
-
+    if msg := _require_file():
+        return msg
     responses = await repl.give(current_file, goalId, expression)
-
+    update_state(responses)
     edits = handle_edits(current_file, responses)
-
     if edits:
         return "\n".join(edits)
-
-    # If no edit, maybe it failed?
-    errors = [r for r in responses if r.get("kind") == "Error"]
-    if errors:
-        return f"Error: {errors[0].get('message')}"
-
-    return "Command executed, but no file edits triggered."
+    err = _error_message(responses)
+    return f"Error: {err}" if err else "Command executed, but no file edits triggered."
 
 
 @mcp.tool()
 async def agda_refine(goalId: int, expression: str) -> str:
-    """Refine a goal with a constructor or function."""
-    if not current_file:
-        return "No file loaded."
-
+    """Refine a goal with a constructor or function. Automatically edits the file."""
+    if msg := _require_file():
+        return msg
     responses = await repl.refine(current_file, goalId, expression)
+    update_state(responses)
     edits = handle_edits(current_file, responses)
     if edits:
         return "\n".join(edits)
-    return "Refinement completed (no edits or manual update needed)."
+    err = _error_message(responses)
+    return f"Error: {err}" if err else "Refinement completed (no edits)."
 
 
 @mcp.tool()
 async def agda_case_split(goalId: int, variable: str) -> str:
-    """Split a goal by pattern matching on a variable."""
-    if not current_file:
-        return "No file loaded."
-
+    """Split a goal by pattern matching on a variable. Automatically edits the file."""
+    if msg := _require_file():
+        return msg
     responses = await repl.case_split(current_file, goalId, variable)
+    update_state(responses)
     edits = handle_edits(current_file, responses)
     if edits:
         return "\n".join(edits)
-    return "Case split completed."
+    err = _error_message(responses)
+    return f"Error: {err}" if err else "Case split completed."
+
+
+@mcp.tool()
+async def agda_auto(goalId: int, hints: str = "") -> str:
+    """Search for a term that solves a goal (Agsy). Fills the hole if found.
+
+    Optional `hints` is a space-separated list of names to use in the search.
+    """
+    if msg := _require_file():
+        return msg
+    responses = await repl.auto_one(current_file, goalId, hints)
+    update_state(responses)
+    edits = handle_edits(current_file, responses)
+    if edits:
+        return "\n".join(edits)
+    err = _error_message(responses)
+    return f"Error: {err}" if err else f"No solution found for ?{goalId}."
+
+
+@mcp.tool()
+async def agda_auto_all() -> str:
+    """Run proof search (Agsy) on every open goal; fills each one it can solve."""
+    if msg := _require_file():
+        return msg
+    responses = await repl.auto_all(current_file)
+    update_state(responses)
+    edits = handle_edits(current_file, responses)
+    if edits:
+        return "\n".join(edits)
+    err = _error_message(responses)
+    return f"Error: {err}" if err else "No goals solved."
+
+
+@mcp.tool()
+async def agda_intro(goalId: int) -> str:
+    """Introduce variables/constructors for a goal (e.g. a lambda for a function type)."""
+    if msg := _require_file():
+        return msg
+    responses = await repl.intro(current_file, goalId)
+    update_state(responses)
+    edits = handle_edits(current_file, responses)
+    if edits:
+        return "\n".join(edits)
+    err = _error_message(responses)
+    return f"Error: {err}" if err else f"Nothing to introduce at ?{goalId}."
 
 
 @mcp.tool()
 async def agda_compute(goalId: int, expression: str) -> str:
-    """Normalize and display an expression in a goal's context."""
-    if not current_file:
-        return "No file loaded."
-
+    """Normalize and display an expression."""
+    if msg := _require_file():
+        return msg
     responses = await repl.compute(current_file, goalId, expression)
-    # Search for 'NormalForm' kind or similar info
     for resp in responses:
         if resp.get("kind") == "DisplayInfo":
             info = resp.get("info", {})
             if info.get("kind") == "NormalForm":
                 return info.get("expr", "")
-    return "No result."
+    err = _error_message(responses)
+    return f"Error: {err}" if err else "No result."
 
 
 @mcp.tool()
 async def agda_infer_type(goalId: int, expression: str) -> str:
-    """Infer the type of an expression in a goal's context."""
-    if not current_file:
-        return "No file loaded."
-
+    """Infer the type of an expression."""
+    if msg := _require_file():
+        return msg
     responses = await repl.infer_type(current_file, goalId, expression)
-    # Look for 'InferredType'
     for resp in responses:
         if resp.get("kind") == "DisplayInfo":
             info = resp.get("info", {})
             if info.get("kind") == "InferredType":
                 return info.get("expr", "")
-    return "No result."
+    err = _error_message(responses)
+    return f"Error: {err}" if err else "No result."
 
 
 @mcp.tool()
 async def agda_why_in_scope(name: str) -> str:
-    """Look up documentation and scope information for a name."""
-    if not current_file:
-        return "No file loaded."
-
-    responses = await repl.why_in_scope(current_file, 0, name)
-
-    # Try to extract meaningful info
+    """Look up scope information for a name."""
+    if msg := _require_file():
+        return msg
+    responses = await repl.why_in_scope(current_file, name)
     for resp in responses:
         if resp.get("kind") == "DisplayInfo":
             info = resp.get("info", {})
-            # Agda often puts the scope info in 'text' or 'message' field of Info_Generic
             if "text" in info:
                 return info["text"]
             if "message" in info:
                 return info["message"]
-
-    return "No scope info found."
+    err = _error_message(responses)
+    return f"Error: {err}" if err else "No scope info found."
 
 
 def main():

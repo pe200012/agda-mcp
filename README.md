@@ -4,7 +4,7 @@ A Python implementation of the [Model Context Protocol (MCP)](https://modelconte
 
 ## Features
 
-The server wraps `agda --interaction-json` to maintain a persistent REPL session. It supports standard interaction commands including load, give, refine, and case split. When using `agda_give`, `agda_refine`, or `agda_case_split`, the server automatically applies the resulting edits to the source file. It uses the `IOTCM` JSON protocol variations found in Agda 2.8+.
+The server wraps `agda --interaction-json` to maintain a persistent REPL session. It supports standard interaction commands including load, give, refine, case split, proof search (`agda_auto` / `agda_auto_all`, via Agsy), and `agda_intro`. `agda_get_goals` lists every goal with its expected type and any warnings in a single call. When using `agda_give`, `agda_refine`, `agda_case_split`, `agda_auto`, `agda_auto_all`, or `agda_intro`, the server automatically applies the resulting edits to the source file. It uses the `IOTCM` JSON protocol variations found in Agda 2.8+.
 
 ## Prerequisites
 
