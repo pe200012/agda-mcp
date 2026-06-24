@@ -5,7 +5,7 @@ description = "A Python implementation of the Agda MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]>=1.0.0,<2",
 ]
 
 [project.scripts]
