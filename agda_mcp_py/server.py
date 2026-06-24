@@ -1,13 +1,15 @@
+import asyncio
 import logging
+import os
 from typing import Dict, List, Any
 from mcp.server.fastmcp import FastMCP
 
 try:
     from .agda_repl import AgdaRepl
-    from .file_edit import replace_hole, replace_line, Range
+    from .file_edit import replace_hole, replace_line, Range, outline
 except ImportError:  # running as a loose script
     from agda_repl import AgdaRepl
-    from file_edit import replace_hole, replace_line, Range
+    from file_edit import replace_hole, replace_line, Range, outline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agda-mcp")
@@ -49,15 +51,23 @@ def update_state(responses: List[Dict[str, Any]]):
                 }
 
 
+def _extract_error(obj: Dict[str, Any]) -> str:
+    # Agda nests the human-readable text under either "message" or "error".message.
+    err = obj.get("error")
+    if isinstance(err, dict) and err.get("message"):
+        return err["message"]
+    return str(obj.get("message") or obj.get("payload") or obj)
+
+
 def _error_message(responses: List[Dict[str, Any]]) -> str:
     for resp in responses:
         if resp.get("kind") == "ParseError":
             return f"Malformed command: {resp.get('message')}"
-        info = resp.get("info") if isinstance(resp.get("info"), dict) else None
         if resp.get("kind") == "Error":
-            return str(resp.get("message", resp))
+            return _extract_error(resp)
+        info = resp.get("info") if isinstance(resp.get("info"), dict) else None
         if info and info.get("kind") == "Error":
-            return str(info.get("message") or info.get("payload") or info)
+            return _extract_error(info)
     return ""
 
 
@@ -316,6 +326,83 @@ async def agda_why_in_scope(name: str) -> str:
                 return info["message"]
     err = _error_message(responses)
     return f"Error: {err}" if err else "No scope info found."
+
+
+@mcp.tool()
+async def agda_outline(file: str = "") -> str:
+    """Token-cheap skeleton of a file: top-level signatures and data/record/module
+    headers, without bodies. Defaults to the currently loaded file."""
+    path = file or current_file
+    if not path:
+        return "No file specified and no file loaded."
+    try:
+        entries = outline(path)
+    except OSError as e:
+        return f"Error reading {path}: {e}"
+    return "\n".join(entries) if entries else "No top-level declarations found."
+
+
+_scratch_counter = 0
+
+
+@mcp.tool()
+async def agda_run_code(code: str) -> str:
+    """Type-check a standalone Agda snippet in an ephemeral module and return the
+    result ("OK" or Agda's errors/warnings). A `module ... where` header is added
+    automatically — provide only declarations. Runs in the loaded file's directory
+    so the project's imports resolve."""
+    global _scratch_counter
+    _scratch_counter += 1
+    workdir = os.path.dirname(current_file) if current_file else os.getcwd()
+    # No underscores: Agda splits names on `_` and a bare-digit part is invalid.
+    mod = f"McpScratch{os.getpid()}c{_scratch_counter}"
+    fname = os.path.join(workdir, mod + ".agda")
+    # ponytail: always wrap; a snippet's own `module X where` becomes a valid submodule.
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(f"module {mod} where\n\n{code}\n")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "agda", fname, cwd=workdir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        msg = (out.decode() + err.decode()).strip()
+        if proc.returncode == 0:
+            return f"OK{chr(10) + msg if msg else ''}"
+        return msg or f"agda exited with code {proc.returncode}"
+    finally:
+        for ext in (".agda", ".agdai"):
+            try:
+                os.remove(os.path.join(workdir, mod + ext))
+            except OSError:
+                pass
+
+
+@mcp.tool()
+async def agda_try(goalId: int, candidates: List[str]) -> str:
+    """Test candidate expressions in a goal WITHOUT editing the file. For each
+    candidate, reports whether it type-checks in the goal's context. Useful for
+    speculatively probing fills before committing one with agda_give."""
+    if msg := _require_file():
+        return msg
+    out = []
+    mutated = False
+    for cand in candidates:
+        responses = await repl.give(current_file, goalId, cand)
+        err = _error_message(responses)
+        accepted = any(r.get("kind") == "GiveAction" for r in responses) and not err
+        if accepted:
+            out.append(f"✓ {cand}")
+            # The give consumed the goal in-session; reload (file is untouched) to
+            # restore it so the next candidate sees the same state.
+            await repl.load_file(current_file)
+            mutated = True
+        else:
+            # A rejected give leaves the goal intact — no reload needed.
+            out.append(f"✗ {cand}  — {err or 'no result'}")
+    if mutated:
+        update_state(await repl.load_file(current_file))
+    return "\n".join(out)
 
 
 def main():

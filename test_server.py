@@ -78,6 +78,30 @@ async def main():
     print(f"[case split] {r}")
     assert "Case split" in r and "f zero" in open(path2).read(), r
 
+    # 8. outline — token-cheap skeleton, no Agda round-trip
+    ol = await S.agda_outline(path)
+    print("[outline]\n" + ol)
+    assert "foo : Nat" in ol and "data Nat : Set where" in ol, ol
+
+    # 9. run_code — ephemeral standalone type-check
+    ok = await S.agda_run_code("data Nat : Set where\n  zero : Nat\n\nx : Nat\nx = zero")
+    print(f"[run_code ok] {ok[:40]!r}")
+    assert ok.startswith("OK"), ok
+    bad = await S.agda_run_code("x : DoesNotExist\nx = nope")
+    print(f"[run_code bad] {bad[:60]!r}")
+    assert "OK" not in bad and bad, bad
+
+    # 10. agda_try — non-destructive candidate testing (file must stay untouched)
+    path3 = os.path.join(d, "Try.agda")
+    with open(path3, "w", encoding="utf-8") as f:
+        f.write("module Try where\n\ndata Nat : Set where\n  zero : Nat\n  suc : Nat → Nat\n\nfoo : Nat\nfoo = ?\n")
+    await S.agda_load(path3)
+    before = open(path3).read()
+    t = await S.agda_try(0, ["bogus thing", "zero", "suc zero"])
+    print("[try]\n" + t)
+    assert "✗ bogus thing" in t and "✓ zero" in t and "✓ suc zero" in t, t
+    assert open(path3).read() == before, "agda_try must not edit the file"
+
     S.repl.stop()
     shutil.rmtree(d, ignore_errors=True)
     print("\nALL PASSED")

@@ -114,6 +114,48 @@ def replace_hole(
     write_file_lines(file_path, lines)
 
 
+_OUTLINE_KEYWORDS = (
+    "data ", "record ", "module ", "postulate", "open ", "import ",
+    "mutual", "instance", "private", "abstract", "variable",
+    "infix", "infixl", "infixr", "syntax ", "pattern ",
+)
+
+
+def outline(file_path: str) -> List[str]:
+    """Top-level declaration skeleton: signatures + data/record/module headers.
+
+    Pure text scan — no Agda round-trip. Returns entries in source order.
+    ponytail: heuristic. Skips `--` line comments and treats column-0 `{-` as a
+    comment start, but doesn't fully parse nested/inline block comments.
+    """
+    lines = read_file_lines(file_path)
+    n = len(lines)
+    out: List[str] = []
+    i = 0
+    while i < n:
+        raw = lines[i].rstrip("\n")
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("--") or stripped.startswith("{-"):
+            i += 1
+            continue
+        if raw[0].isspace():  # indented = body/continuation, not a top-level decl
+            i += 1
+            continue
+        is_sig = " : " in raw or stripped.endswith(":")
+        if not (stripped.startswith(_OUTLINE_KEYWORDS) or is_sig):
+            i += 1
+            continue
+        entry = stripped
+        i += 1
+        # Join wrapped signature lines, but not the indented body of a `where` block.
+        if not stripped.endswith("where"):
+            while i < n and lines[i].strip() and lines[i][0].isspace():
+                entry += " " + lines[i].strip()
+                i += 1
+        out.append(entry)
+    return out
+
+
 def replace_line(file_path: str, line_num: int, new_lines: List[str]):
     """
     Replaces a specific line with a list of new lines (for case splitting).
