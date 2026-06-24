@@ -14,11 +14,19 @@ The server wraps `agda --interaction-json` to maintain a persistent REPL session
 
 ## Installation and usage
 
-### Zero-install (recommended)
+### Claude Code (one-liner)
 
-Run the server directly from the GitHub repository using `uv`.
+Requires [`uv`](https://docs.astral.sh/uv/) and `agda` on your PATH. Then:
 
-Add this to your MCP settings file (e.g., `~/.config/claude-code/mcp.json`):
+```bash
+claude mcp add agda-mcp-py -- uvx --from git+https://github.com/pe200012/agda-mcp agda-mcp-py
+```
+
+Add `-s user` to make it available in every project (default scope is the current project). `uvx` fetches and runs the server straight from GitHub — nothing to clone or install.
+
+### Zero-install (manual config)
+
+Alternatively, add this to your MCP settings file (e.g., `~/.config/claude-code/mcp.json`):
 
 ```json
 {
