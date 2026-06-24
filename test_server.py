@@ -132,6 +132,15 @@ async def main():
     print(f"[unicode give] {r}")
     assert "Filled" in r and "g = λ x → suc x" in open(path4, encoding="utf-8").read(), r
 
+    # 12. Unsolved metavariables must be reported (they hide in invisibleGoals,
+    #     not visibleGoals — a file with them isn't fully checked).
+    path5 = os.path.join(d, "Meta.agda")
+    with open(path5, "w", encoding="utf-8") as f:
+        f.write("module Meta where\npostulate A : Set\nfoo : A\nfoo = _\n")
+    r = await S.agda_load(path5)
+    print(f"[unsolved] {r}")
+    assert "0 goal" in r and "unsolved metavariable" in r, r
+
     S.repl.stop()
     shutil.rmtree(d, ignore_errors=True)
     print("\nALL PASSED")

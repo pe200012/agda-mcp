@@ -20,7 +20,10 @@ repl = AgdaRepl()
 # State refreshed from every command's responses.
 goals_map: Dict[int, Range] = {}
 goal_types: Dict[int, str] = {}
-last_diagnostics: Dict[str, List[str]] = {"errors": [], "warnings": []}
+# "unsolved" = types of unsolved metavariables (Agda's invisibleGoals) — these
+# are not `?` holes, so they don't show up as goals, but the file isn't fully
+# checked while any remain.
+last_diagnostics: Dict[str, List[str]] = {"errors": [], "warnings": [], "unsolved": []}
 current_file: str = ""
 
 
@@ -48,6 +51,7 @@ def update_state(responses: List[Dict[str, Any]]):
                 last_diagnostics = {
                     "errors": [str(e) for e in info.get("errors", [])],
                     "warnings": [str(w) for w in info.get("warnings", [])],
+                    "unsolved": [g.get("type", "?") for g in info.get("invisibleGoals", [])],
                 }
 
 
@@ -152,6 +156,9 @@ async def agda_load(file: str) -> str:
     out = [f"Loaded {file}. {len(goals_map)} goal(s)."]
     if last_diagnostics["warnings"]:
         out.append(f"{len(last_diagnostics['warnings'])} warning(s).")
+    if last_diagnostics["unsolved"]:
+        # Not a clean check: unsolved metas remain even though there are no `?` holes.
+        out.append(f"{len(last_diagnostics['unsolved'])} unsolved metavariable(s).")
     return " ".join(out)
 
 
