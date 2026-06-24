@@ -59,6 +59,21 @@ def _extract_error(obj: Dict[str, Any]) -> str:
     return str(obj.get("message") or obj.get("payload") or obj)
 
 
+def _goals_from(responses: List[Dict[str, Any]]) -> Dict[int, str]:
+    """id -> type for every goal in the last AllGoalsWarnings of `responses`."""
+    goals: Dict[int, str] = {}
+    for resp in responses:
+        if resp.get("kind") == "DisplayInfo":
+            info = resp.get("info", {})
+            if info.get("kind") == "AllGoalsWarnings":
+                goals = {}
+                for g in info.get("visibleGoals", []):
+                    gid = g.get("constraintObj", {}).get("id")
+                    if gid is not None:
+                        goals[gid] = g.get("type", "?")
+    return goals
+
+
 def _error_message(responses: List[Dict[str, Any]]) -> str:
     for resp in responses:
         if resp.get("kind") == "ParseError":
@@ -379,27 +394,40 @@ async def agda_run_code(code: str) -> str:
 
 
 @mcp.tool()
-async def agda_try(goalId: int, candidates: List[str]) -> str:
+async def agda_try(goalId: int, candidates: List[str], refine: bool = False) -> str:
     """Test candidate expressions in a goal WITHOUT editing the file. For each
-    candidate, reports whether it type-checks in the goal's context. Useful for
-    speculatively probing fills before committing one with agda_give."""
+    candidate, reports whether it type-checks and, if so, the sub-goals it leaves
+    behind (the holes' types) or whether it fully solves the goal.
+
+    Set refine=True to use refinement (Agda inserts holes for missing arguments,
+    e.g. `suc` -> `suc ?`) instead of giving the expression verbatim. Useful for
+    speculatively probing fills before committing one with agda_give/agda_refine.
+    """
     if msg := _require_file():
         return msg
+    attempt = repl.refine if refine else repl.give
+    baseline = set(_goals_from(await repl.get_goals(current_file)))
     out = []
     mutated = False
     for cand in candidates:
-        responses = await repl.give(current_file, goalId, cand)
+        responses = await attempt(current_file, goalId, cand)
         err = _error_message(responses)
         accepted = any(r.get("kind") == "GiveAction" for r in responses) and not err
-        if accepted:
-            out.append(f"✓ {cand}")
-            # The give consumed the goal in-session; reload (file is untouched) to
-            # restore it so the next candidate sees the same state.
-            await repl.load_file(current_file)
-            mutated = True
+        if not accepted:
+            # A rejected give/refine leaves the goal intact — no reload needed.
+            out.append(f"✗ {cand}  — {(err or 'no result').splitlines()[0]}")
+            continue
+        # New sub-goals are the ids not present before this attempt.
+        after = _goals_from(responses)
+        new_types = [after[i] for i in sorted(after) if i not in baseline]
+        if new_types:
+            out.append(f"✓ {cand}  → leaves {len(new_types)} hole(s): " + ", ".join(new_types))
         else:
-            # A rejected give leaves the goal intact — no reload needed.
-            out.append(f"✗ {cand}  — {err or 'no result'}")
+            out.append(f"✓ {cand}  → solves goal")
+        # The attempt consumed/changed goals in-session; reload (file untouched)
+        # to restore the baseline state for the next candidate.
+        await repl.load_file(current_file)
+        mutated = True
     if mutated:
         update_state(await repl.load_file(current_file))
     return "\n".join(out)

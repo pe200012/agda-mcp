@@ -97,10 +97,18 @@ async def main():
         f.write("module Try where\n\ndata Nat : Set where\n  zero : Nat\n  suc : Nat → Nat\n\nfoo : Nat\nfoo = ?\n")
     await S.agda_load(path3)
     before = open(path3).read()
-    t = await S.agda_try(0, ["bogus thing", "zero", "suc zero"])
-    print("[try]\n" + t)
-    assert "✗ bogus thing" in t and "✓ zero" in t and "✓ suc zero" in t, t
+    t = await S.agda_try(0, ["bogus thing", "zero", "suc ?"])
+    print("[try give]\n" + t)
+    assert "✗ bogus thing" in t, t
+    assert "✓ zero  → solves goal" in t, t
+    assert "✓ suc ?  → leaves 1 hole(s): Nat" in t, t          # sub-goal reporting
     assert open(path3).read() == before, "agda_try must not edit the file"
+
+    # refine mode: `suc` auto-inserts a hole -> leaves a Nat sub-goal
+    tr = await S.agda_try(0, ["suc"], refine=True)
+    print("[try refine]\n" + tr)
+    assert "✓ suc  → leaves 1 hole(s): Nat" in tr, tr
+    assert open(path3).read() == before, "agda_try (refine) must not edit the file"
 
     S.repl.stop()
     shutil.rmtree(d, ignore_errors=True)
